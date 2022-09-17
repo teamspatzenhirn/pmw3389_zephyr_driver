@@ -54,3 +54,10 @@ void sensor_readout() {
     LOG_INF("DELTA_X: %f, DELTA_Y: %f", sensor_value_to_double(&v_x), sensor_value_to_double(&v_y));
 }
 ```
+
+## Writing Out-Of-Tree Drivers
+Since this was kind of a pain to figure out, here are a few helpful links if you want to do this:
+* https://jdelaney.me/posts/zephyr-oot-modules/
+* https://interrupt.memfault.com/blog/building-drivers-on-zephyr
+* https://blog.golioth.io/adding-an-out-of-tree-sensor-driver-to-zephyr/
+* https://github.com/zephyrproject-rtos/zephyr/tree/main/samples/application_development/out_of_tree_driver
