@@ -4,8 +4,6 @@
 
 #define DT_DRV_COMPAT pixart_pmw3389
 
-#error E
-
 #include "pmw3389.h"
 
 #include <zephyr/drivers/spi.h>

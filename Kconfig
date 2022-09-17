@@ -1,1 +1,1 @@
-source "drivers/sensor/pmw3389/Kconfig"
+rsource "drivers/sensor/pmw3389/Kconfig"
