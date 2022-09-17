@@ -1,0 +1,1 @@
+add_subdirectory_ifdef(CONFIG_PMW3389 drivers/sensor/pmw3389)

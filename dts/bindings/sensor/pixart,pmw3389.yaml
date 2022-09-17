@@ -1,0 +1,17 @@
+# Copyright (c) 2022 Team Spatzenhirn
+# SPDX-License-Identifier: Apache-2.0
+
+
+description: |
+  Motion Sensor
+
+compatible: "pixart,pmw3389"
+
+include: spi-device.yaml
+
+properties:
+  resolution:
+    type: int
+    required: true
+    description: |
+      Resolution in counts per inch, multiples of 50, from 50 to 16000
