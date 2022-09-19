@@ -331,7 +331,8 @@ void fetch_burst(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delt
 
 int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan)
 {
-	if (chan != SENSOR_CHAN_PMW3389_DISTANCE_X && chan != SENSOR_CHAN_PMW3389_DISTANCE_Y) {
+	if (chan != SENSOR_CHAN_PMW3389_DISTANCE_X && chan != SENSOR_CHAN_PMW3389_DISTANCE_Y &&
+	    chan != SENSOR_CHAN_ALL) {
 		return -EINVAL;
 	}
 
