@@ -161,7 +161,7 @@ void burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_byt
 	k_busy_wait(T_SRAD_MOTBR_US);
 
 	// 5. Start reading SPI data continuously up to 12bytes.
-	struct spi_buf rx_buffers = {.buf = out, .len = 12};
+	struct spi_buf rx_buffers = {.buf = out, .len = nr_bytes};
 	struct spi_buf_set rx_buffer_set = {.buffers = &rx_buffers, .count = 1};
 	spi_transceive_dt(spec, NULL, &rx_buffer_set);
 
