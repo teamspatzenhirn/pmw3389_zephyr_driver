@@ -8,6 +8,7 @@
 
 #include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
+// #include <zephyr/sys/base64.h>
 
 LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
 
@@ -22,6 +23,8 @@ LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
 #define REG_Resolution_H   0x0F
 #define REG_Power_Up_Reset 0x3A
 #define REG_Motion_Burst   0x50
+#define REG_Frame_Capture  0x12
+#define REG_RawData_Burst  0x64
 
 #define REG_Product_ID	    0x00
 #define Expected_Product_ID 0x47
@@ -148,6 +151,7 @@ uint8_t read_register(const struct spi_dt_spec *spec, uint8_t addr)
  */
 void burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_bytes)
 {
+	LOG_DBG("Starting burst read!");
 	// 1. Write any value to Motion_Burst register
 	write_register(spec, REG_Motion_Burst, 0);
 
@@ -167,6 +171,21 @@ void burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_byt
 
 	// Motion burst may be terminated by pulling NCS high for at least t_BEXIT
 	spi_release_dt(spec);
+	LOG_DBG("Burst read done.");
+}
+
+void raw_data(const struct spi_dt_spec *spec, uint8_t out[])
+{
+	write_register(spec, 0x10, 0x00);
+	write_register(spec, REG_Frame_Capture, 0x83);
+	write_register(spec, REG_Frame_Capture, 0xC5);
+	k_sleep(K_MSEC(20));
+	send_byte(spec, REG_RawData_Burst);
+	k_busy_wait(T_SRAD_US);
+	for (int i = 0; i < 1296; i++) {
+		out[i] = receive_byte(spec);
+		k_busy_wait(15);
+	}
 }
 
 /**
@@ -247,7 +266,7 @@ int pmw3389_init(const struct device *dev)
 	// 11. Load configuration for other registers.
 
 	// Set resolution
-	LOG_INF("Configuring resolution: %dcpi", config->resolution_cpi);
+	LOG_INF("Configuring resolution: %d cpi", config->resolution_cpi);
 	if (config->resolution_cpi < 50 || config->resolution_cpi > 16000) {
 		LOG_ERR("Resolution of %d is out of range [%d, %d]", config->resolution_cpi, 50,
 			16000);
@@ -264,6 +283,7 @@ int pmw3389_init(const struct device *dev)
 	write_register(spec, REG_Resolution_L, resolution & 0xFF);
 
 	// Verify communication
+	// TODO: Also read Inverse_Product_ID at 0x3F, should be 0xB8
 	LOG_INF("Verifying communication by reading product ID");
 	k_busy_wait(DELAY_WRITE_READ);
 	uint8_t received_product_id = read_register(spec, REG_Product_ID);
@@ -318,8 +338,8 @@ void fetch_manual(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *del
 
 void fetch_burst(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delta_y)
 {
-	uint8_t data[6] = {0};
-	burst_read_motion(spec, data, 6);
+	uint8_t data[7] = {0};
+	burst_read_motion(spec, data, 7);
 	if (is_bit_set(data[0], BIT_Motion_MOT)) {
 		*delta_x = signed_16_from_parts(data[2], data[3]);
 		*delta_y = signed_16_from_parts(data[4], data[5]);
@@ -327,6 +347,9 @@ void fetch_burst(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delt
 		*delta_x = 0;
 		*delta_y = 0;
 	}
+
+	// uint8_t squal_data = data[6];
+	// LOG_INF("SQUAL %d", squal_data);
 }
 
 int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan)
@@ -342,6 +365,25 @@ int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan)
 
 	// fetch_manual(spec, &data->delta_x, &data->delta_y);
 	fetch_burst(spec, &data->delta_x, &data->delta_y);
+
+	/*
+	uint8_t image[1296];
+	//LOG_INF("Requesting raw data!");
+	k_sleep(K_MSEC(100));
+	raw_data(spec, image);
+
+	char base64_string[1729];
+	base64_string[1728] = 0;
+	size_t bytes_written = 0;
+	int error = base64_encode(base64_string, sizeof(base64_string), &bytes_written, image,
+				  sizeof(image));
+	if (error != 0 || bytes_written >= sizeof(base64_string)) {
+		LOG_ERR("Error encoding base64: %d", error);
+		return -1;
+	}
+	base64_string[bytes_written] = 0;
+	LOG_INF("Data: %s", base64_string);
+	*/
 
 	return 0;
 }
