@@ -39,7 +39,6 @@ Example of reading sensor values:
 ```c++
 #define MOTION_SENSOR_NODE DT_NODELABEL(motion_sensor)
 constexpr const device *motion_sensor_dev = DEVICE_DT_GET(MOTION_SENSOR_NODE);
-static_assert(motion_sensor_dev != nullptr);
 
 void sensor_readout() {
     sensor_sample_fetch(motion_sensor_dev);
