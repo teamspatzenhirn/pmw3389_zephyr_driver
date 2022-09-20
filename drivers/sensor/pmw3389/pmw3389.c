@@ -15,6 +15,18 @@ LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
 // Undefine to fall back to reading each register separately
 #define FETCH_USING_BURST_READ
 
+struct pmw3389_config {
+	struct spi_dt_spec spi;
+	int resolution_cpi; // [counts/inch]
+};
+
+struct pmw3389_data {
+	int16_t delta_x;
+	int16_t delta_y;
+};
+
+// region SPI Registers and Timing Constants
+
 #define REG_Product_ID		    0x00
 #define Expected_Product_ID	    0x47
 #define REG_Motion		    0x02
@@ -55,6 +67,10 @@ LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
 #define DELAY_READ_WRITE  T_SRW_US
 #define DELAY_READ_READ	  T_SRR_US
 
+// endregion
+
+// region Utility
+
 // Return error code, if != 0
 #define TRY(that)                                                                                  \
 	{                                                                                          \
@@ -73,6 +89,24 @@ LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
 			return error;                                                              \
 		}                                                                                  \
 	}
+
+static bool is_bit_set(uint8_t value, uint8_t index)
+{
+	return (value & (1 << index)) != 0;
+}
+
+static int16_t signed_16_from_parts(uint8_t low, uint8_t high)
+{
+	int res = low;
+	res |= high << 8;
+	return (int16_t)res;
+}
+
+// endregion
+
+// region SPI Bus
+
+// Note: Functions with _nr suffix do not release the SPI bus (chip select)!
 
 /*
  * Chip SPI Interface description
@@ -93,33 +127,6 @@ LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
  * 0-bit, 7-bit address, T_SRAD delay, 8-bit data
  * (delay T_SCLK_NCS_READ (120ns), pull NCS high)
  */
-
-struct pmw3389_config {
-	struct spi_dt_spec spi;
-	int resolution_cpi; // [counts/inch]
-};
-
-struct pmw3389_data {
-	int16_t delta_x;
-	int16_t delta_y;
-};
-
-/**
- * @param reg 7-bit register address
- * @note: Delay by DELAY_WRITE_WRITE until starting the next write, or DELAY_WRITE_READ
- *        until starting next read
- * @note Does not release SPI bus!
- * @return a value from spi_write().
- */
-int write_register_nr(const struct spi_dt_spec *spec, uint8_t reg, uint8_t data)
-{
-	// Set first address bit to 1 to indicate write
-	uint8_t tx_data[] = {reg | 0b10000000, data};
-	struct spi_buf tx_buffer = {.buf = tx_data, .len = sizeof(tx_data)};
-	struct spi_buf_set tx_buffer_set = {.buffers = &tx_buffer, .count = 1};
-
-	return spi_write_dt(spec, &tx_buffer_set);
-}
 
 /**
  * @note Does not release SPI bus!
@@ -147,6 +154,23 @@ static int receive_byte_nr(const struct spi_dt_spec *spec, uint8_t *out)
 }
 
 /**
+ * @param reg 7-bit register address
+ * @note: Delay by DELAY_WRITE_WRITE until starting the next write, or DELAY_WRITE_READ
+ *        until starting next read
+ * @note Does not release SPI bus!
+ * @return a value from spi_write().
+ */
+int write_register_nr(const struct spi_dt_spec *spec, uint8_t reg, uint8_t data)
+{
+	// Set first address bit to 1 to indicate write
+	uint8_t tx_data[] = {reg | 0b10000000, data};
+	struct spi_buf tx_buffer = {.buf = tx_data, .len = sizeof(tx_data)};
+	struct spi_buf_set tx_buffer_set = {.buffers = &tx_buffer, .count = 1};
+
+	return spi_write_dt(spec, &tx_buffer_set);
+}
+
+/**
  * @param addr 7-bit register address
  * @return Register contents
  * @note Delay by T_SRR or T_SRW until starting the next read/write
@@ -161,6 +185,25 @@ int read_register_nr(const struct spi_dt_spec *spec, uint8_t addr, uint8_t *out)
 	k_busy_wait(T_SRAD_US);
 	// Read Data
 	return receive_byte_nr(spec, out);
+}
+
+/**
+ * Read multiple registers
+ */
+int read_multiple(const struct spi_dt_spec *spec, const uint8_t addresses[], int nr_addresses,
+		  uint8_t data_out[])
+{
+	for (int i = 0; i < nr_addresses; i++) {
+		TRY_R(read_register_nr(spec, addresses[i], &data_out[i]));
+		// Wait T_SRR if not last
+		if (i != nr_addresses - 1) {
+			k_busy_wait(DELAY_READ_READ);
+		}
+	}
+
+	// T_SCLK_NCS_READ: omitted because small (120ns)
+	TRY(spi_release_dt(spec));
+	return 0;
 }
 
 /**
@@ -208,6 +251,66 @@ int burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_byte
 	return 0;
 }
 
+/**
+ * Fetch motion data by manually reading each register
+ */
+void fetch_manual(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delta_y)
+{
+	// For first motion read, write any value to Motion register first (?)
+	write_register_nr(spec, REG_Motion, 0x00);
+	k_busy_wait(DELAY_WRITE_READ);
+
+	uint8_t motion = 0;
+	read_register_nr(spec, REG_Motion, &motion);
+	if (is_bit_set(motion, BIT_Motion_MOT)) {
+		// Motion has occurred!
+		uint8_t results[4] = {0};
+		uint8_t addresses[4] = {REG_Delta_X_L, REG_Delta_X_H, REG_Delta_Y_L, REG_Delta_Y_H};
+		k_busy_wait(DELAY_READ_READ);
+		read_multiple(spec, addresses, 4, results);
+		*delta_x = signed_16_from_parts(results[0], results[1]);
+		*delta_y = signed_16_from_parts(results[2], results[3]);
+	} else {
+		// No motion has occurred
+		*delta_x = 0;
+		*delta_y = 0;
+	}
+
+	spi_release_dt(spec);
+}
+
+/**
+ * Fetch motion data using burst read
+ * @param squal If != NULL, out parameter for surface quality
+ * @return 0 or negative error code
+ */
+int fetch_burst(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delta_y, uint8_t *squal)
+{
+	int len = 6;
+	if (squal != NULL) {
+		len = 7;
+	}
+
+	uint8_t data[12] = {0};
+	TRY(burst_read_motion(spec, data, len));
+	if (is_bit_set(data[0], BIT_Motion_MOT)) {
+		*delta_x = signed_16_from_parts(data[2], data[3]);
+		*delta_y = signed_16_from_parts(data[4], data[5]);
+	} else {
+		*delta_x = 0;
+		*delta_y = 0;
+	}
+
+	if (squal != NULL) {
+		*squal = data[6];
+	}
+	return 0;
+}
+
+// endregion
+
+// region Driver Functions
+
 int pwm3389_get_raw_data(struct device *dev, uint8_t *out)
 {
 	const struct pmw3389_config *config = dev->config;
@@ -223,25 +326,6 @@ int pwm3389_get_raw_data(struct device *dev, uint8_t *out)
 		TRY_R(receive_byte_nr(spec, &out[i]));
 		k_busy_wait(15);
 	}
-	TRY(spi_release_dt(spec));
-	return 0;
-}
-
-/**
- * Read multiple registers
- */
-int read_multiple(const struct spi_dt_spec *spec, const uint8_t addresses[], int nr_addresses,
-		  uint8_t data_out[])
-{
-	for (int i = 0; i < nr_addresses; i++) {
-		TRY_R(read_register_nr(spec, addresses[i], &data_out[i]));
-		// Wait T_SRR if not last
-		if (i != nr_addresses - 1) {
-			k_busy_wait(DELAY_READ_READ);
-		}
-	}
-
-	// T_SCLK_NCS_READ: omitted because small (120ns)
 	TRY(spi_release_dt(spec));
 	return 0;
 }
@@ -326,7 +410,6 @@ int pmw3389_init(const struct device *dev)
 	TRY_R(write_register_nr(spec, REG_Resolution_L, resolution & 0xFF));
 
 	// Verify communication
-	// TODO: Also read Inverse_Product_ID at 0x3F, should be 0xB8
 	LOG_DBG("Verifying communication by reading product ID");
 	k_busy_wait(DELAY_WRITE_READ);
 	uint8_t received_product_id = 0;
@@ -353,74 +436,6 @@ int pmw3389_init(const struct device *dev)
 
 	TRY(spi_release_dt(spec));
 	LOG_INF("Done!");
-	return 0;
-}
-
-static bool is_bit_set(uint8_t value, uint8_t index)
-{
-	return (value & (1 << index)) != 0;
-}
-
-static int16_t signed_16_from_parts(uint8_t low, uint8_t high)
-{
-	int res = low;
-	res |= high << 8;
-	return (int16_t)res;
-}
-
-/**
- * Fetch motion data by manually reading each register
- */
-void fetch_manual(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delta_y)
-{
-	// For first motion read, write any value to Motion register first (?)
-	write_register_nr(spec, REG_Motion, 0x00);
-	k_busy_wait(DELAY_WRITE_READ);
-
-	uint8_t motion = 0;
-	read_register_nr(spec, REG_Motion, &motion);
-	if (is_bit_set(motion, BIT_Motion_MOT)) {
-		// Motion has occurred!
-		uint8_t results[4] = {0};
-		uint8_t addresses[4] = {REG_Delta_X_L, REG_Delta_X_H, REG_Delta_Y_L, REG_Delta_Y_H};
-		k_busy_wait(DELAY_READ_READ);
-		read_multiple(spec, addresses, 4, results);
-		*delta_x = signed_16_from_parts(results[0], results[1]);
-		*delta_y = signed_16_from_parts(results[2], results[3]);
-	} else {
-		// No motion has occurred
-		*delta_x = 0;
-		*delta_y = 0;
-	}
-
-	spi_release_dt(spec);
-}
-
-/**
- * Fetch motion data using burst read
- * @param squal If != NULL, out parameter for surface quality
- * @return 0 or negative error code
- */
-int fetch_burst(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delta_y, uint8_t *squal)
-{
-	int len = 6;
-	if (squal != NULL) {
-		len = 7;
-	}
-
-	uint8_t data[12] = {0};
-	TRY(burst_read_motion(spec, data, len));
-	if (is_bit_set(data[0], BIT_Motion_MOT)) {
-		*delta_x = signed_16_from_parts(data[2], data[3]);
-		*delta_y = signed_16_from_parts(data[4], data[5]);
-	} else {
-		*delta_x = 0;
-		*delta_y = 0;
-	}
-
-	if (squal != NULL) {
-		*squal = data[6];
-	}
 	return 0;
 }
 
@@ -466,6 +481,8 @@ int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
 
 	return 0;
 }
+
+// endregion
 
 static const struct sensor_driver_api pmw3389_api = {
 	.sample_fetch = pmw3389_sample_fetch,
