@@ -8,26 +8,29 @@
 
 #include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
-// #include <zephyr/sys/base64.h>
+#include <zephyr/sys/__assert.h>
 
 LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
 
-#define REG_Motion     0x02
-#define BIT_Motion_MOT 7
+// Undefine to fall back to reading each register separately
+#define FETCH_USING_BURST_READ
 
-#define REG_Delta_X_L	   0x03
-#define REG_Delta_X_H	   0x04
-#define REG_Delta_Y_L	   0x05
-#define REG_Delta_Y_H	   0x06
-#define REG_Resolution_L   0x0E
-#define REG_Resolution_H   0x0F
-#define REG_Power_Up_Reset 0x3A
-#define REG_Motion_Burst   0x50
-#define REG_Frame_Capture  0x12
-#define REG_RawData_Burst  0x64
-
-#define REG_Product_ID	    0x00
-#define Expected_Product_ID 0x47
+#define REG_Product_ID		    0x00
+#define Expected_Product_ID	    0x47
+#define REG_Motion		    0x02
+#define BIT_Motion_MOT		    7
+#define REG_Delta_X_L		    0x03
+#define REG_Delta_X_H		    0x04
+#define REG_Delta_Y_L		    0x05
+#define REG_Delta_Y_H		    0x06
+#define REG_Resolution_L	    0x0E
+#define REG_Resolution_H	    0x0F
+#define REG_Frame_Capture	    0x12
+#define REG_Power_Up_Reset	    0x3A
+#define REG_Inverse_Product_ID	    0x3F
+#define Expected_Inverse_Product_ID 0xB8
+#define REG_Motion_Burst	    0x50
+#define REG_RawData_Burst	    0x64
 
 // Min command interval of write commands
 #define T_SWW_US 180
@@ -51,6 +54,25 @@ LOG_MODULE_REGISTER(pmw3389, LOG_LEVEL_INF);
 #define DELAY_WRITE_READ  (T_SWR_US - 4)
 #define DELAY_READ_WRITE  T_SRW_US
 #define DELAY_READ_READ	  T_SRR_US
+
+// Return error code, if != 0
+#define TRY(that)                                                                                  \
+	{                                                                                          \
+		int error = that;                                                                  \
+		if (error != 0) {                                                                  \
+			return error;                                                              \
+		}                                                                                  \
+	}
+
+// Release SPI and return error code, if != 0
+#define TRY_R(that)                                                                                \
+	{                                                                                          \
+		int error = that;                                                                  \
+		if (error != 0) {                                                                  \
+			spi_release_dt(spec);                                                      \
+			return error;                                                              \
+		}                                                                                  \
+	}
 
 /*
  * Chip SPI Interface description
@@ -84,51 +106,61 @@ struct pmw3389_data {
 
 /**
  * @param reg 7-bit register address
- * @note: Delay by T_SWW-(write_time) until starting the next write, or T_SWR-(address_send_time)
+ * @note: Delay by DELAY_WRITE_WRITE until starting the next write, or DELAY_WRITE_READ
  *        until starting next read
+ * @note Does not release SPI bus!
+ * @return a value from spi_write().
  */
-void write_register(const struct spi_dt_spec *spec, uint8_t reg, uint8_t data)
+int write_register_nr(const struct spi_dt_spec *spec, uint8_t reg, uint8_t data)
 {
 	// Set first address bit to 1 to indicate write
 	uint8_t tx_data[] = {reg | 0b10000000, data};
 	struct spi_buf tx_buffer = {.buf = tx_data, .len = sizeof(tx_data)};
 	struct spi_buf_set tx_buffer_set = {.buffers = &tx_buffer, .count = 1};
 
-	spi_write_dt(spec, &tx_buffer_set);
+	return spi_write_dt(spec, &tx_buffer_set);
 }
 
-static void send_byte(const struct spi_dt_spec *spec, uint8_t data)
+/**
+ * @note Does not release SPI bus!
+ * @return a value from spi_write().
+ */
+static int send_byte_nr(const struct spi_dt_spec *spec, uint8_t data)
 {
 	uint8_t tx_data[] = {data};
 	struct spi_buf tx_buffer = {.buf = tx_data, .len = sizeof(tx_data)};
 	struct spi_buf_set tx_buffer_set = {.buffers = &tx_buffer, .count = 1};
 
-	spi_write_dt(spec, &tx_buffer_set);
+	return spi_write_dt(spec, &tx_buffer_set);
 }
 
-static uint8_t receive_byte(const struct spi_dt_spec *spec)
+/**
+ * @note Does not release SPI bus!
+ * @return a value from spi_read().
+ */
+// NOLINTNEXTLINE(readability-non-const-parameter)
+static int receive_byte_nr(const struct spi_dt_spec *spec, uint8_t *out)
 {
-	uint8_t data;
-	struct spi_buf rx_buffer = {.buf = &data, .len = 1};
+	struct spi_buf rx_buffer = {.buf = out, .len = 1};
 	struct spi_buf_set rx_buffer_set = {.buffers = &rx_buffer, .count = 1};
-
-	spi_read_dt(spec, &rx_buffer_set);
-	return data;
+	return spi_read_dt(spec, &rx_buffer_set);
 }
 
 /**
  * @param addr 7-bit register address
  * @return Register contents
  * @note Delay by T_SRR or T_SRW until starting the next read/write
+ * @note Does not release SPI bus!
+ * @return a value from spi_read().
  */
-uint8_t read_register(const struct spi_dt_spec *spec, uint8_t addr)
+int read_register_nr(const struct spi_dt_spec *spec, uint8_t addr, uint8_t *out)
 {
 	// Write address
-	send_byte(spec, addr & ~(1 << 7));
+	send_byte_nr(spec, addr & ~(1 << 7));
 	// Wait T_SRAD
 	k_busy_wait(T_SRAD_US);
 	// Read Data
-	return receive_byte(spec);
+	return receive_byte_nr(spec, out);
 }
 
 /**
@@ -149,17 +181,18 @@ uint8_t read_register(const struct spi_dt_spec *spec, uint8_t addr)
  * @param out
  * @param nr_bytes
  */
-void burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_bytes)
+// NOLINTNEXTLINE(readability-non-const-parameter)
+int burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_bytes)
 {
 	LOG_DBG("Starting burst read!");
 	// 1. Write any value to Motion_Burst register
-	write_register(spec, REG_Motion_Burst, 0);
+	TRY_R(write_register_nr(spec, REG_Motion_Burst, 0));
 
 	// 2. Lower NCS
 	// (is already low)
 
 	// 3. Send Motion_Burst address (0x50).
-	send_byte(spec, REG_Motion_Burst);
+	TRY_R(send_byte_nr(spec, REG_Motion_Burst));
 
 	// 4. Wait for t_SRAD_MOTBR
 	k_busy_wait(T_SRAD_MOTBR_US);
@@ -167,35 +200,41 @@ void burst_read_motion(const struct spi_dt_spec *spec, uint8_t out[], int nr_byt
 	// 5. Start reading SPI data continuously up to 12bytes.
 	struct spi_buf rx_buffers = {.buf = out, .len = nr_bytes};
 	struct spi_buf_set rx_buffer_set = {.buffers = &rx_buffers, .count = 1};
-	spi_transceive_dt(spec, NULL, &rx_buffer_set);
+	TRY_R(spi_transceive_dt(spec, NULL, &rx_buffer_set));
 
 	// Motion burst may be terminated by pulling NCS high for at least t_BEXIT
-	spi_release_dt(spec);
+	TRY(spi_release_dt(spec));
 	LOG_DBG("Burst read done.");
+	return 0;
 }
 
-void raw_data(const struct spi_dt_spec *spec, uint8_t out[])
+int pwm3389_get_raw_data(struct device *dev, uint8_t *out)
 {
-	write_register(spec, 0x10, 0x00);
-	write_register(spec, REG_Frame_Capture, 0x83);
-	write_register(spec, REG_Frame_Capture, 0xC5);
+	const struct pmw3389_config *config = dev->config;
+	const struct spi_dt_spec *spec = &config->spi;
+
+	TRY_R(write_register_nr(spec, 0x10, 0x00));
+	TRY_R(write_register_nr(spec, REG_Frame_Capture, 0x83));
+	TRY_R(write_register_nr(spec, REG_Frame_Capture, 0xC5));
 	k_sleep(K_MSEC(20));
-	send_byte(spec, REG_RawData_Burst);
+	TRY_R(send_byte_nr(spec, REG_RawData_Burst));
 	k_busy_wait(T_SRAD_US);
 	for (int i = 0; i < 1296; i++) {
-		out[i] = receive_byte(spec);
+		TRY_R(receive_byte_nr(spec, &out[i]));
 		k_busy_wait(15);
 	}
+	TRY(spi_release_dt(spec));
+	return 0;
 }
 
 /**
- * Read multiple registers, releases SPI after!
+ * Read multiple registers
  */
-void read_multiple(const struct spi_dt_spec *spec, const uint8_t addresses[], int nr_addresses,
-		   uint8_t data_out[])
+int read_multiple(const struct spi_dt_spec *spec, const uint8_t addresses[], int nr_addresses,
+		  uint8_t data_out[])
 {
 	for (int i = 0; i < nr_addresses; i++) {
-		data_out[i] = read_register(spec, addresses[i]);
+		TRY_R(read_register_nr(spec, addresses[i], &data_out[i]));
 		// Wait T_SRR if not last
 		if (i != nr_addresses - 1) {
 			k_busy_wait(DELAY_READ_READ);
@@ -203,7 +242,8 @@ void read_multiple(const struct spi_dt_spec *spec, const uint8_t addresses[], in
 	}
 
 	// T_SCLK_NCS_READ: omitted because small (120ns)
-	spi_release_dt(spec);
+	TRY(spi_release_dt(spec));
+	return 0;
 }
 
 int pmw3389_init(const struct device *dev)
@@ -219,9 +259,9 @@ int pmw3389_init(const struct device *dev)
 	// 1. Apply Power
 	// 2. Drive NCS high, then low (done by driver)
 	// 3. Write 0x5A to Power_Up_Reset register
-	LOG_INF("Resetting device");
-	write_register(spec, REG_Power_Up_Reset, 0x5A);
-	spi_release_dt(spec);
+	LOG_DBG("Resetting device");
+	TRY_R(write_register_nr(spec, REG_Power_Up_Reset, 0x5A));
+	TRY(spi_release_dt(spec));
 	// 4. Wait for at least 50ms.
 	k_sleep(K_MSEC(50));
 
@@ -229,24 +269,27 @@ int pmw3389_init(const struct device *dev)
 	// pin state.
 	uint8_t addresses[] = {0x02, 0x03, 0x04, 0x05, 0x06};
 	uint8_t dummy_read[sizeof(addresses)];
-	read_multiple(spec, addresses, sizeof(addresses), dummy_read);
+	TRY(read_multiple(spec, addresses, sizeof(addresses), dummy_read));
 
 	// (6. Perform SROM download [Refer to 7.1 SROM Download].)
+	// TODO: Find out why/if that is necessary, and which SROM to steal from where
 
 	// 7. Write to register 0x3D with value 0x80.
 	// Last op was read if SROM DL was not performed -> wait T_SRW
 	k_busy_wait(DELAY_READ_WRITE);
-	write_register(spec, 0x3D, 0x80);
+	TRY_R(write_register_nr(spec, 0x3D, 0x80));
 
 	k_busy_wait(DELAY_WRITE_READ);
 
 	// 8. Read register 0x3D at 1ms interval until value 0xC0 is obtained or read up to
 	//    55ms. This register read interval must be carried out at 1ms interval with timing
 	//    tolerance of +/- 1%.
+	LOG_DBG("Waiting for proper value in 0x3D...");
 	while (true) {
 		// Do not wait T_SRR since the 1ms is way longer anyway
-		uint8_t result_3D = read_register(spec, 0x3D);
-		LOG_INF("Got %#x", result_3D);
+		uint8_t result_3D = 0;
+		TRY_R(read_register_nr(spec, 0x3D, &result_3D));
+		LOG_DBG(" Got %#x", result_3D);
 		if (result_3D == 0xC0) {
 			break;
 		}
@@ -255,18 +298,18 @@ int pmw3389_init(const struct device *dev)
 
 	// 9. Write to register 0x3D with value 0x00.
 	k_busy_wait(DELAY_READ_WRITE);
-	write_register(spec, 0x3D, 0x00);
+	TRY_R(write_register_nr(spec, 0x3D, 0x00));
 
 	// 10. Write 0x20 to register 0x10
 	// 0x10 is Config2, 0x20=0b00100000 enables the REST mode and sets CPI to addect both X and
 	// Y
 	k_busy_wait(DELAY_WRITE_WRITE);
-	write_register(spec, 0x10, 0x20);
+	TRY_R(write_register_nr(spec, 0x10, 0x20));
 
 	// 11. Load configuration for other registers.
 
 	// Set resolution
-	LOG_INF("Configuring resolution: %d cpi", config->resolution_cpi);
+	LOG_DBG("Configuring resolution: %d cpi", config->resolution_cpi);
 	if (config->resolution_cpi < 50 || config->resolution_cpi > 16000) {
 		LOG_ERR("Resolution of %d is out of range [%d, %d]", config->resolution_cpi, 50,
 			16000);
@@ -278,24 +321,37 @@ int pmw3389_init(const struct device *dev)
 	}
 	uint16_t resolution = config->resolution_cpi / 50;
 	k_busy_wait(DELAY_WRITE_WRITE);
-	write_register(spec, REG_Resolution_H, resolution >> 8);
+	TRY_R(write_register_nr(spec, REG_Resolution_H, resolution >> 8));
 	k_busy_wait(DELAY_WRITE_WRITE);
-	write_register(spec, REG_Resolution_L, resolution & 0xFF);
+	TRY_R(write_register_nr(spec, REG_Resolution_L, resolution & 0xFF));
 
 	// Verify communication
 	// TODO: Also read Inverse_Product_ID at 0x3F, should be 0xB8
-	LOG_INF("Verifying communication by reading product ID");
+	LOG_DBG("Verifying communication by reading product ID");
 	k_busy_wait(DELAY_WRITE_READ);
-	uint8_t received_product_id = read_register(spec, REG_Product_ID);
+	uint8_t received_product_id = 0;
+	TRY_R(read_register_nr(spec, REG_Product_ID, &received_product_id));
 	if (received_product_id != Expected_Product_ID) {
 		LOG_ERR("Read product ID %#x, but expected %#x, could not verify communication "
 			"with sensor!",
 			received_product_id, Expected_Product_ID);
-		return -1; // TODO: Proper error code
+		spi_release_dt(spec);
+		return -EIO;
 	}
-	LOG_INF("Verified product ID!");
+	LOG_DBG("Verified product ID!");
+	LOG_DBG("Verifying communication by reading inverse product ID");
+	k_busy_wait(DELAY_READ_READ);
+	TRY_R(read_register_nr(spec, REG_Inverse_Product_ID, &received_product_id));
+	if (received_product_id != Expected_Inverse_Product_ID) {
+		LOG_ERR("Read inverse product ID %#x, but expected %#x, could not verify "
+			"communication with sensor!",
+			received_product_id, Expected_Inverse_Product_ID);
+		spi_release_dt(spec);
+		return -EIO;
+	}
+	LOG_DBG("Verified inverse product ID!");
 
-	spi_release_dt(spec);
+	TRY(spi_release_dt(spec));
 	LOG_INF("Done!");
 	return 0;
 }
@@ -312,13 +368,17 @@ static int16_t signed_16_from_parts(uint8_t low, uint8_t high)
 	return (int16_t)res;
 }
 
+/**
+ * Fetch motion data by manually reading each register
+ */
 void fetch_manual(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delta_y)
 {
 	// For first motion read, write any value to Motion register first (?)
-	write_register(spec, REG_Motion, 0x00);
+	write_register_nr(spec, REG_Motion, 0x00);
 	k_busy_wait(DELAY_WRITE_READ);
 
-	uint8_t motion = read_register(spec, REG_Motion);
+	uint8_t motion = 0;
+	read_register_nr(spec, REG_Motion, &motion);
 	if (is_bit_set(motion, BIT_Motion_MOT)) {
 		// Motion has occurred!
 		uint8_t results[4] = {0};
@@ -336,10 +396,20 @@ void fetch_manual(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *del
 	spi_release_dt(spec);
 }
 
-void fetch_burst(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delta_y)
+/**
+ * Fetch motion data using burst read
+ * @param squal If != NULL, out parameter for surface quality
+ * @return 0 or negative error code
+ */
+int fetch_burst(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delta_y, uint8_t *squal)
 {
-	uint8_t data[7] = {0};
-	burst_read_motion(spec, data, 7);
+	int len = 6;
+	if (squal != NULL) {
+		len = 7;
+	}
+
+	uint8_t data[12] = {0};
+	TRY(burst_read_motion(spec, data, len));
 	if (is_bit_set(data[0], BIT_Motion_MOT)) {
 		*delta_x = signed_16_from_parts(data[2], data[3]);
 		*delta_y = signed_16_from_parts(data[4], data[5]);
@@ -348,8 +418,10 @@ void fetch_burst(const struct spi_dt_spec *spec, int16_t *delta_x, int16_t *delt
 		*delta_y = 0;
 	}
 
-	// uint8_t squal_data = data[6];
-	// LOG_INF("SQUAL %d", squal_data);
+	if (squal != NULL) {
+		*squal = data[6];
+	}
+	return 0;
 }
 
 int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan)
@@ -363,28 +435,11 @@ int pmw3389_sample_fetch(const struct device *dev, enum sensor_channel chan)
 	const struct spi_dt_spec *spec = &config->spi;
 	struct pmw3389_data *data = dev->data;
 
-	// fetch_manual(spec, &data->delta_x, &data->delta_y);
-	fetch_burst(spec, &data->delta_x, &data->delta_y);
-
-	/*
-	uint8_t image[1296];
-	//LOG_INF("Requesting raw data!");
-	k_sleep(K_MSEC(100));
-	raw_data(spec, image);
-
-	char base64_string[1729];
-	base64_string[1728] = 0;
-	size_t bytes_written = 0;
-	int error = base64_encode(base64_string, sizeof(base64_string), &bytes_written, image,
-				  sizeof(image));
-	if (error != 0 || bytes_written >= sizeof(base64_string)) {
-		LOG_ERR("Error encoding base64: %d", error);
-		return -1;
-	}
-	base64_string[bytes_written] = 0;
-	LOG_INF("Data: %s", base64_string);
-	*/
-
+#ifdef FETCH_USING_BURST_READ
+	TRY(fetch_burst(spec, &data->delta_x, &data->delta_y, NULL));
+#else
+	fetch_manual(spec, &data->delta_x, &data->delta_y);
+#endif
 	return 0;
 }
 
@@ -407,9 +462,7 @@ int pmw3389_channel_get(const struct device *dev, enum sensor_channel chan,
 		return -ENOTSUP;
 	}
 
-	int conversion_err = sensor_value_from_double(
-		val, (double)counts / (39.3700787 * config->resolution_cpi));
-	assert(conversion_err == 0);
+	TRY(sensor_value_from_double(val, (double)counts / (39.3700787 * config->resolution_cpi)));
 
 	return 0;
 }
